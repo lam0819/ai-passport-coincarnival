@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="zh-HK">
+<head>
+<meta charset="utf-8">
+<title>金幣嘉年華 Coin Carnival — AI Passport prototype</title>
+<style>
+  body { background: #111; color: #bbb; font: 13px system-ui, sans-serif; margin: 0; display: flex; flex-direction: column; align-items: center; }
+  #wrap { margin-top: 12px; padding: 14px; background: #262626; border-radius: 18px; }
+  canvas { width: 960px; height: 720px; image-rendering: pixelated; display: block; background: #000; }
+  #btns { display: flex; gap: 14px; margin: 12px; }
+  #btns button { width: 96px; height: 56px; border-radius: 12px; border: 0; background: #444; color: #fff; font: bold 15px system-ui; }
+  #btns button:active { background: #666; }
+  #help { max-width: 900px; text-align: center; line-height: 1.6; }
+  kbd { background: #333; border-radius: 3px; padding: 0 4px; }
+  #out { white-space: pre; font: 12px monospace; color: #8f8; margin: 10px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="320" height="240"></canvas></div>
+<div id="btns"><button id="bu">UP ◀</button><button id="bo">OK</button><button id="bd">DOWN ▶</button></div>
+<div id="help">
+  <kbd>↑</kbd>/<kbd>W</kbd> = UP（落幣口向左） · <kbd>↓</kbd>/<kbd>S</kbd> = DOWN（向右） · <kbd>Space</kbd>/<kbd>Enter</kbd> = OK<br>
+  OK 撳一下落一個幣；㩒住連發（每秒 4 個）。落幣口頂住邊 1.5 秒 = 暫停選單。只用虛擬遊戲幣，冇真錢、冇課金。<br>
+  Prototype of Coin Carnival, an original coin pusher for AI Passport · 320×240 logical screen scaled ×3 · one key read at a time
+</div>
+<div id="out"></div>
+<script>
+'use strict';
+/* =====================================================================
+ * 金幣嘉年華 Coin Carnival — browser prototype (single file).
+ * Same rules and tunables as the firmware (main/config.h; see PLAN.md):
+ * - field units: 1 unit = 1 px at the front edge; coins are discs (R units)
+ * - the pusher plate slides forward/back; coins dropped on its top are
+ *   scraped off by the back wall onto the field; the plate face pushes the
+ *   field forward; coins over the front lip are won, over the open side
+ *   edges (gutters) are lost
+ * - quasi-static position-based physics: coins only move when pushed
+ *   (friction), overlaps are resolved a few iterations per step, deep
+ *   overlaps pop the rear coin on top (stacks of 2)
+ * ===================================================================== */
+
+const C = {
+  DT: 1 / 30,
+  FW: 200, FL: 150,               // field width, depth (back wall y=0 → front lip y=FL)
+  R: 8, BALL_R: 12, PRIZE_R: 11,
+  PUSH_MIN: 34, PUSH_MAX: 66, PUSH_PERIOD: 2.6,
+  WALL_END: 70,                   // side walls from the back to here; past it the sides are open gutters
+  PAY_W: 96,                     // the front lip pays only in its middle: the corners are lose holes
+  MAX_OBJ: 160,                   // fixed pool on the device
+  START_FIELD: 96, START_BANK: 100,
+  DROP_TIME: 0.45, RAPID_AFTER: 0.3, RAPID: 0.25,
+  AIM_SPEED: 120, JITTER: 6,
+  GATE_W: 16, GATE_SPEED: 1.0,
+  ITER: 3, STIFF: 0.55, STACK_POP: 0.42,
+  SLOT_Q: 4,                      // pending slot spins (保留)
+  REGEN_S: 30, REGEN_CAP: 50, RESCUE: 20, RESCUE_WAIT: 8,
+  PLAY_REWARD_S: 300, PLAY_REWARD: 30, ACTIVE_S: 20,   // every 5 min of active play: +30 coins
+  JP_STEP: 0.1,                   // jackpot pool grows 0.1 coin per coin dropped
+  EDGE_HOLD: 1.5,
+  SAVE_EVERY: 10,
+};
+
+const THEMES = [
+  { zh: '海旁夜市', en: 'HARBOUR NIGHT', cost: 0, balls: 2, gate: 1.0, gateSpeed: 1.0, jp: 300,
+    sky: '#0f1a33', wall: '#24345e', field: '#24467a', plate: '#8c96ad', accent: '#ffcc33', lamp: '#ff5a7a',
+    prizes: [['魚蛋', 'FISHBALLS', '#e8a23c'], ['雞蛋仔', 'EGG WAFFLE', '#f2d16b'], ['紅白藍袋', 'STRIPED BAG', '#d23b3b'],
+             ['叮叮', 'TRAM', '#2f9e4f'], ['天星小輪', 'FERRY', '#3c7fd2'], ['霓虹燈', 'NEON SIGN', '#ff4fd8']] },
+  { zh: '糖果工場', en: 'CANDY FACTORY', cost: 150, balls: 3, gate: 1.0, gateSpeed: 1.0, jp: 300,
+    sky: '#3a1838', wall: '#6b2a5e', field: '#a24d84', plate: '#f3c1d8', accent: '#ffe066', lamp: '#6cf0ff',
+    prizes: [['波板糖', 'LOLLIPOP', '#ff6f91'], ['棉花糖', 'MARSHMALLOW', '#fff0f5'], ['朱古力', 'CHOCOLATE', '#7b4a2e'],
+             ['啫喱', 'JELLY', '#7cdb5a'], ['薄荷糖', 'MINT', '#7fe3d3'], ['金幣朱古力', 'GOLD CHOC', '#ffd23a']] },
+  { zh: '太空站', en: 'SPACE STATION', cost: 400, balls: 2, gate: 1.5, gateSpeed: 1.7, jp: 400,
+    sky: '#05060f', wall: '#1d2440', field: '#2c3566', plate: '#a8b3d6', accent: '#7fd8ff', lamp: '#b3ff5a',
+    prizes: [['火箭', 'ROCKET', '#e8e8f0'], ['衛星', 'SATELLITE', '#c0c8d8'], ['太空人', 'ASTRONAUT', '#ffffff'],
+             ['外星仔', 'ALIEN', '#79e06b'], ['月球', 'MOON ROCK', '#b0a890'], ['土星', 'RINGED PLANET', '#e8b860']] },
+  { zh: '龍宮寶藏', en: 'DRAGON PALACE', cost: 900, balls: 2, gate: 1.0, gateSpeed: 1.2, jp: 600,
+    sky: '#03202a', wall: '#0d4a52', field: '#12707a', plate: '#d9c38a', accent: '#ffd23a', lamp: '#ff6b3d',
+    prizes: [['珍珠', 'PEARL', '#f4f0e8'], ['珊瑚', 'CORAL', '#ff7b6b'], ['玉佩', 'JADE CHARM', '#5ad19a'],
+             ['金魚', 'GOLDFISH', '#ff9a2e'], ['龍珠', 'DRAGON ORB', '#ff4040'], ['寶箱', 'TREASURE BOX', '#c8962e']] },
+];
+const NPRIZE = THEMES.length * 6;
+
+/* slot: weighted outcomes (one roll decides the whole spin) */
+const SYMS = ['CHERRY', 'BELL', 'STAR', 'SEVEN', 'BAG'];
+const SLOT_TABLE = [   // [weight, symbol index or -1 for a miss, reward]
+  [15, 0, { coins: 2 }], [7, 1, { coins: 5 }], [4, 2, { wheel: 1 }], [1.5, 3, { jpc: 1 }], [6, 4, { tickets: 10 }], [67, -1, {}],
+];
+/* roulette (a bonus ball pushed off the front) */
+const WHEEL = [
+  { c: 3 }, { t: 5 }, { c: 4 }, { t: 10 }, { c: 2 }, { t: 15 },
+  { c: 6 }, { t: 5 }, { c: 4 }, { t: 20 }, { c: 10 }, { t: 5 },
+];
+/* jackpot chance funnel pockets */
+const POCKETS = [{ c: 20, w: 45 }, { c: 30, w: 30 }, { c: 50, w: 18 }, { jp: 1, w: 7 }];
+
+/* ---------------------------------------------------------------- rng */
+let rngS = 0x2545F491;
+function seed(s) { rngS = (s >>> 0) || 1; }
+function rand() { rngS ^= rngS << 13; rngS >>>= 0; rngS ^= rngS >>> 17; rngS ^= rngS << 5; rngS >>>= 0; return rngS / 4294967296; }
+function pickW(list, wf) { let tot = 0; for (const e of list) tot += wf(e); let r = rand() * tot; for (const e of list) { r -= wf(e); if (r < 0) return e; } return list[list.length - 1]; }
+
+/* ---------------------------------------------------------------- state */
+const S = {};
+function freshState() {
+  Object.assign(S, {
+    mode: 'title', menu: 0, armed: false, msg: '', msgT: 0,
+    theme: 0, owned: 1, bank: C.START_BANK, tickets: 0, jp: THEMES[0].jp,
+    coll: new Array(NPRIZE).fill(0), setsDone: 0, sound: true, swap: false,
+    stats: { dropped: 0, won: 0, lost: 0, minted: 0, gifts: 0, playRewards: 0, slot: 0, roul: 0, jpc: 0, jpwin: 0, prizes: 0, ballsOff: 0, overflow: 0 },
+    objs: [], pushT: 0, pushY: C.PUSH_MIN, aim: C.FW / 2, gateT: 0,
+    drops: [], shower: 0, showerT: 0, slotQ: 0, slot: null, roul: null, jpc: null,
+    ballWait: [], prizeWait: 0, popups: [], trayFlash: 0,
+    regenT: 0, playT: 0, idleT: 0, rescueT: 0, saveT: 0,
+    okT: 0, rapidT: 0, edgeT: 0, holdT: 0, field0: 0, time: 0,
+  });
+}
+
+/* ---------------------------------------------------------------- objects */
+const T_COIN = 0, T_BALL = 1, T_PRIZE = 2;
+function mk(t, x, y, layer) {
+  if (S.objs.length >= C.MAX_OBJ) return null;
+  const o = { t, x, y, px: x, py: y, layer, h: 0, sup: null, dead: false, pid: -1,
+    r: t === T_COIN ? C.R : t === T_BALL ? C.BALL_R : C.PRIZE_R, m: t === T_COIN ? 1 : t === T_BALL ? 5 : 6 };
+  S.objs.push(o);
+  return o;
+}
+const theme = () => THEMES[S.theme];
+function coinsInMachine() {
+  let n = 0;
+  for (const o of S.objs) if (o.t === T_COIN) n++;
+  for (const d of S.drops) if (d.t === T_COIN) n++;
+  return n + S.shower;
+}
+
+function newField() {
+  S.objs.length = 0; S.drops.length = 0; S.shower = 0; S.ballWait.length = 0;
+  S.pushT = 0; S.pushY = C.PUSH_MIN;
+  // hex-packed rows in front of the plate, a few gaps, a handful on the plate
+  let n = 0;
+  for (let row = 0; n < C.START_FIELD; row++) {
+    const y = C.PUSH_MIN + C.R + row * C.R * 1.75;
+    if (y > C.FL - C.R * 1.2) break;
+    for (let x = C.R + (row % 2) * C.R; x <= C.FW - C.R && n < C.START_FIELD; x += C.R * 2.05) {
+      if (rand() < 0.12) continue;
+      mk(T_COIN, x + (rand() - 0.5), y + (rand() - 0.5), 0); n++;
+    }
+  }
+  for (let i = 0; i < 14; i++) mk(T_COIN, C.R + rand() * (C.FW - 2 * C.R), C.R + rand() * (C.PUSH_MIN - 2 * C.R), 1);
+  for (let i = 0; i < theme().balls; i++) { const b = mk(T_BALL, 40 + i * 60 + rand() * 20, C.FL - 40 - rand() * 20, 0); }
+  for (let i = 0; i < 2; i++) spawnPrize(40 + i * 110, C.FL - 60);
+  // settle without paying anything out
+  const keep = JSON.stringify(S.stats), bank = S.bank;
+  for (let i = 0; i < 90; i++) physics(C.DT, true);
+  S.stats = JSON.parse(keep); S.bank = bank;
+  S.field0 = coinsInMachine();
+}
+function spawnPrize(x, y) {
+  const th = S.theme, pid = th * 6 + Math.floor(rand() * 6);
+  const o = y === undefined ? null : mk(T_PRIZE, x, y, 0);
+  if (o) { o.pid = pid; return o; }
+  // dropped from the hopper onto the plate
+  S.drops.push({ t: T_PRIZE, x: C.R + rand() * (C.FW - 2 * C.R), age: 0, pid, free: true, checked: true });
+}
+
+/* ---------------------------------------------------------------- physics */
+function separate(list, popping) {
+  list.sort((a, b) => a.x - b.x);
+  const n = list.length;
+  let pops = 0;
+  for (let i = 0; i < n; i++) {
+    const a = list[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = list[j];
+      const rr = a.r + b.r;
+      let dx = b.x - a.x;
+      if (dx >= rr) break;
+      let dy = b.y - a.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= rr * rr) continue;
+      let d = Math.sqrt(d2);
+      if (d < 0.01) { dx = rand() - 0.5; dy = 0.5; d = Math.hypot(dx, dy); }
+      const ov = rr - d;
+      if (popping && pops < 3 && a.t === T_COIN && b.t === T_COIN && ov > C.STACK_POP * rr) {
+        const back = a.y < b.y ? a : b, front = back === a ? b : a;   // the rear coin rides up onto the front one
+        back.h = 1; back.sup = front; pops++;
+        continue;
+      }
+      const nx = dx / d, ny = dy / d, k = ov * C.STIFF, tm = a.m + b.m;
+      a.x -= nx * k * (b.m / tm); a.y -= ny * k * (b.m / tm);
+      b.x += nx * k * (a.m / tm); b.y += ny * k * (a.m / tm);
+    }
+  }
+}
+const _top = [], _f0 = [], _f1 = [];
+function physics(dt, settling) {
+  const prev = S.pushY;
+  S.pushT += dt;
+  S.pushY = C.PUSH_MIN + (C.PUSH_MAX - C.PUSH_MIN) * (0.5 - 0.5 * Math.cos(2 * Math.PI * S.pushT / C.PUSH_PERIOD));
+  const dp = S.pushY - prev;
+  for (const o of S.objs) { o.px = o.x; o.py = o.y; }
+  // plate top rides with the plate; the back wall holds coins back
+  for (const o of S.objs) if (o.layer === 1) { o.y += dp; if (o.y < o.r) o.y = o.r; }
+  // stacked coins ride on their support
+  for (const o of S.objs) {
+    if (o.layer !== 0 || o.h !== 1) continue;
+    const s = o.sup;
+    if (!s || s.dead || s.layer !== 0 || s.h !== 0) { o.h = 0; o.sup = null; continue; }
+    o.x += s.x - s.px; o.y += s.y - s.py;
+  }
+  _top.length = _f0.length = _f1.length = 0;
+  for (const o of S.objs) (o.layer === 1 ? _top : o.h ? _f1 : _f0).push(o);
+  for (let it = 0; it < C.ITER; it++) {
+    for (const o of _f0) if (o.y < S.pushY + o.r) o.y = S.pushY + o.r;
+    for (const o of _f1) if (o.y < S.pushY + o.r) o.y = S.pushY + o.r;
+    separate(_f0, it === C.ITER - 1);
+    separate(_top, false);
+    for (const o of S.objs) {
+      if (o.layer === 1 || o.y < C.WALL_END) { if (o.x < o.r) o.x = o.r; if (o.x > C.FW - o.r) o.x = C.FW - o.r; }
+    }
+  }
+  separate(_f1, false);
+  for (const o of _f0) if (o.y < S.pushY + o.r) o.y = S.pushY + o.r;
+  // stacked coins without anything under them drop down
+  for (const o of _f1) {
+    if (o.h !== 1) continue;
+    let s = o.sup;
+    const near = (q) => q && !q.dead && q.layer === 0 && q.h === 0 && Math.hypot(q.x - o.x, q.y - o.y) < o.r * 1.15;
+    if (!near(s)) { s = null; for (const q of _f0) if (q.t === T_COIN && near(q)) { s = q; break; } }
+    if (s) o.sup = s; else { o.h = 0; o.sup = null; }
+  }
+  // plate coins past the plate face fall onto the field
+  for (const o of _top) if (o.y > S.pushY) { o.layer = 0; o.h = 0; o.y = S.pushY + o.r * 0.6; }
+  // front lip and side gutters
+  for (const o of S.objs) {
+    if (o.layer !== 0) continue;
+    if (o.y > C.FL) { o.dead = true; if (!settling) { if (Math.abs(o.x - C.FW / 2) <= C.PAY_W / 2) won(o); else lost(o); } }
+    else if ((o.x < 0 || o.x > C.FW) && o.y >= C.WALL_END) { o.dead = true; if (!settling) lost(o); }
+  }
+  if (S.objs.some((o) => o.dead)) S.objs = S.objs.filter((o) => !o.dead);
+}
+
+/* ---------------------------------------------------------------- outcomes */
+function popup(text, col) { S.popups.push({ text, col: col || '#fff', t: 1.2 }); if (S.popups.length > 4) S.popups.shift(); }
+function won(o) {
+  if (o.t === T_COIN) { S.bank++; S.stats.won++; S.trayFlash = 0.3; sfx(1400, 0.04); }
+  else if (o.t === T_BALL) { S.stats.ballsOff++; startRoulette(); S.ballWait.push(2.5); }
+  else { collect(o.pid); }
+}
+function lost(o) {
+  if (o.t === T_COIN) S.stats.lost++;
+  else if (o.t === T_BALL) S.ballWait.push(1.5);       // balls run in a closed loop
+  else S.prizeWait = Math.max(S.prizeWait, 8);
+}
+function collect(pid) {
+  S.coll[pid]++; S.stats.prizes++; S.tickets += 5;
+  const th = THEMES[Math.floor(pid / 6)], p = th.prizes[pid % 6];
+  popup('PRIZE: ' + p[1] + ' +5T', p[2]); sfx(880, 0.2, 'triangle');
+  const t = Math.floor(pid / 6);
+  if (!(S.setsDone & (1 << t)) && S.coll.slice(t * 6, t * 6 + 6).every((c) => c > 0)) {
+    S.setsDone |= 1 << t; S.tickets += 100; popup('SET COMPLETE +100T', '#ffd23a');
+  }
+  S.prizeWait = Math.max(S.prizeWait, 6);
+}
+function mint(n) {   // reward coins: a shower onto the plate, the rest straight to the bank
+  S.stats.minted += n;
+  const room = Math.max(0, C.MAX_OBJ - 20 - S.objs.length - S.drops.length - S.shower);
+  const toField = Math.min(n, 30, room);
+  S.shower += toField;
+  S.bank += n - toField; S.stats.overflow += n - toField;
+}
+function award(r, src) {
+  if (r.c) { mint(r.c); popup(src + ' +' + r.c + ' COINS', '#ffd23a'); }
+  if (r.coins) { mint(r.coins); popup(src + ' +' + r.coins + ' COINS', '#ffd23a'); }
+  if (r.t) { S.tickets += r.t; popup(src + ' +' + r.t + ' TICKETS', '#ff9ad5'); }
+  if (r.tickets) { S.tickets += r.tickets; popup(src + ' +' + r.tickets + ' TICKETS', '#ff9ad5'); }
+  if (r.wheel) { popup('STAR: SPIN THE WHEEL!', '#7fd8ff'); startRoulette(); }
+  if (r.jpc) startJpc();
+}
+function chance() {
+  if (S.slotQ < C.SLOT_Q) S.slotQ++;
+  sfx(660, 0.08, 'square');
+}
+function startSlot() {
+  const e = pickW(SLOT_TABLE, (e) => e[0]);
+  let reels;
+  if (e[1] >= 0) reels = [e[1], e[1], e[1]];
+  else { reels = [Math.floor(rand() * 5), Math.floor(rand() * 5), Math.floor(rand() * 5)]; if (reels[0] === reels[1] && reels[1] === reels[2]) reels[2] = (reels[2] + 1) % 5; }
+  S.slot = { t: 0, reels, reward: e[2] };
+  S.stats.slot++;
+}
+function startRoulette() { S.roul = S.roul || { t: 0, seg: Math.floor(rand() * WHEEL.length), queued: 0 }; if (S.roul.t > 0) S.roul.queued++; S.stats.roul++; }
+function startJpc() { if (S.jpc) return; S.jpc = { t: 0, pocket: POCKETS.indexOf(pickW(POCKETS, (p) => p.w)) }; S.stats.jpc++; sfx(523, 0.3, 'square'); }
+
+/* ---------------------------------------------------------------- drops */
+function dropCoin() {
+  if (S.bank <= 0) { S.msg = 'NO COINS'; S.msgT = 1; return false; }
+  S.bank--; S.stats.dropped++; S.jp += C.JP_STEP;
+  S.drops.push({ t: T_COIN, x: S.aim + (rand() - 0.5) * 2 * C.JITTER, age: 0, checked: false, free: false });
+  sfx(300, 0.03, 'square');
+  return true;
+}
+function gateX() { return C.FW / 2 + (C.FW / 2 - 18) * Math.sin(S.gateT * 1.3); }
+function land(d) {
+  const x = Math.min(C.FW - C.R, Math.max(C.R, d.x));
+  const y = d.t === T_COIN ? C.R + rand() * Math.max(1, S.pushY - 2 * C.R) : C.BALL_R;   // balls and prizes enter at the back
+  const o = mk(d.t, x, y, 1);
+  if (!o) {   // pool full: a coin goes back to the bank, a ball or prize waits for room
+    if (d.t === T_COIN) { S.bank++; S.stats.overflow++; } else if (d.t === T_BALL) S.ballWait.push(1); else S.prizeWait = Math.max(S.prizeWait, 3);
+    return;
+  }
+  if (d.t === T_PRIZE) o.pid = d.pid;
+}
+
+/* ---------------------------------------------------------------- update */
+function updatePlay(dt) {
+  const th = theme();
+  S.time += dt;
+  S.gateT += dt * C.GATE_SPEED * th.gateSpeed;
+  const gx = gateX();
+  for (const d of S.drops) {
+    d.age += dt;
+    if (!d.checked && d.age >= C.DROP_TIME * 0.5) {
+      d.checked = true;
+      if (Math.abs(d.x - gx) < C.GATE_W * th.gate / 2) chance();
+    }
+  }
+  for (let i = S.drops.length - 1; i >= 0; i--) if (S.drops[i].age >= C.DROP_TIME) { land(S.drops[i]); S.drops.splice(i, 1); }
+  if (S.shower > 0) {
+    S.showerT += dt;
+    while (S.showerT >= 0.06 && S.shower > 0) {
+      S.showerT -= 0.06; S.shower--;
+      S.drops.push({ t: T_COIN, x: C.R + rand() * (C.FW - 2 * C.R), age: C.DROP_TIME * 0.3, checked: true, free: true });
+    }
+  } else S.showerT = 0;
+  for (let i = S.ballWait.length - 1; i >= 0; i--) {
+    S.ballWait[i] -= dt;
+    if (S.ballWait[i] <= 0 && !S.roul) { S.ballWait.splice(i, 1); S.drops.push({ t: T_BALL, x: 30 + rand() * (C.FW - 60), age: 0, checked: true, free: true }); }
+  }
+  if (S.prizeWait > 0) { S.prizeWait -= dt; if (S.prizeWait <= 0 && S.objs.filter((o) => o.t === T_PRIZE).length < 2) spawnPrize(); }
+  // slot
+  if (!S.slot && S.slotQ > 0) { S.slotQ--; startSlot(); }
+  if (S.slot) { S.slot.t += dt; if (S.slot.t >= 2.0) { award(S.slot.reward, 'SLOT'); if (S.slot.reward.coins || S.slot.reward.tickets) sfx(990, 0.15, 'triangle'); S.slot = null; } }
+  if (S.roul) {
+    S.roul.t += dt;
+    if (S.roul.t >= 2.6) { award(WHEEL[S.roul.seg], 'WHEEL'); const q = S.roul.queued; S.roul = null; if (q > 0) { S.roul = { t: 0, seg: Math.floor(rand() * WHEEL.length), queued: q - 1 }; } }
+  }
+  if (S.jpc) {
+    S.jpc.t += dt;
+    if (S.jpc.t >= 3.2) {
+      const p = POCKETS[S.jpc.pocket];
+      if (p.jp) { const n = Math.floor(S.jp); S.stats.jpwin++; mint(n); popup('JACKPOT +' + n + '!!', '#ff4040'); S.jp = th.jp; sfx(1046, 0.5, 'square'); }
+      else { mint(p.c); popup('JP CHANCE +' + p.c, '#ffd23a'); }
+      S.jpc = null;
+    }
+  }
+  physics(dt, false);
+  // never stuck: slow refill while low, and a rescue when everything has run dry
+  if (S.bank < C.REGEN_CAP) { S.regenT += dt; if (S.regenT >= C.REGEN_S) { S.regenT -= C.REGEN_S; S.bank++; S.stats.gifts++; } } else S.regenT = 0;
+  if (S.bank === 0 && S.drops.length === 0 && S.shower === 0 && !S.slot && !S.roul && !S.jpc) {
+    S.rescueT += dt;
+    if (S.rescueT >= C.RESCUE_WAIT) { S.rescueT = 0; S.bank += C.RESCUE; S.stats.gifts += C.RESCUE; popup('RESCUE +' + C.RESCUE + ' COINS', '#7fd8ff'); }
+  } else S.rescueT = 0;
+  if (S.idleT < C.ACTIVE_S) {   // only active play counts (a key in the last 20 s)
+    S.playT += dt;
+    if (S.playT >= C.PLAY_REWARD_S) { S.playT -= C.PLAY_REWARD_S; S.bank += C.PLAY_REWARD; S.stats.gifts += C.PLAY_REWARD; S.stats.playRewards++; popup('PLAY REWARD +' + C.PLAY_REWARD + ' COINS', '#7fd8ff'); }
+  }
+  S.saveT += dt; if (S.saveT >= C.SAVE_EVERY) { S.saveT = 0; save(); }
+}
+function decay(dt) {
+  for (const p of S.popups) p.t -= dt;
+  S.popups = S.popups.filter((p) => p.t > 0);
+  if (S.trayFlash > 0) S.trayFlash -= dt;
+  if (S.msgT > 0) S.msgT -= dt;
+}
+
+/* ---------------------------------------------------------------- input (one key at a time, like the board) */
+const held = { up: false, down: false, ok: false };
+let order = [];             // most recent last: the board reads one key, the latest wins
+let pressed = null;
+function setKey(k, down) {
+  if (down) { if (!held[k]) { held[k] = true; order = order.filter((q) => q !== k); order.push(k); pressed = k; audioInit(); } }
+  else { held[k] = false; order = order.filter((q) => q !== k); }
+}
+function activeKey() { return order.length ? order[order.length - 1] : null; }
+
+function stepInput(dt) {
+  const k = activeKey(), p = pressed;
+  S.idleT = k ? 0 : S.idleT + dt;
+  pressed = null;
+  if (S.mode === 'play') {
+    if (k === 'up' || k === 'down') {
+      S.holdT += dt;
+      let dir = k === 'up' ? -1 : 1; if (S.swap) dir = -dir;
+      const sp = S.holdT < 0.15 ? 0.35 : 1;
+      S.aim += dir * C.AIM_SPEED * sp * dt;
+      const lim = S.aim <= C.R || S.aim >= C.FW - C.R;
+      S.aim = Math.min(C.FW - C.R, Math.max(C.R, S.aim));
+      if (lim) { S.edgeT += dt; if (S.edgeT >= C.EDGE_HOLD) { S.edgeT = 0; S.mode = 'pause'; S.menu = 0; save(); } } else S.edgeT = 0;
+    } else { S.holdT = 0; S.edgeT = 0; }
+    if (k === 'ok') {
+      if (p === 'ok') dropCoin();
+      S.okT += dt;
+      if (S.okT >= C.RAPID_AFTER) { S.rapidT += dt; while (S.rapidT >= C.RAPID) { S.rapidT -= C.RAPID; dropCoin(); } }
+    } else { S.okT = 0; S.rapidT = 0; }
+    return;
+  }
+  const items = menuItems();
+  if (p === 'up') { S.menu = (S.menu + items.length - 1) % items.length; S.armed = false; sfx(500, 0.02); }
+  if (p === 'down') { S.menu = (S.menu + 1) % items.length; S.armed = false; sfx(500, 0.02); }
+  if (p === 'ok') { menuChoose(items[S.menu]); sfx(700, 0.04); }
+}
+
+/* ---------------------------------------------------------------- menus */
+function menuItems() {
+  if (S.mode === 'title') return [{ id: 'play', l: 'PLAY  開機' }, { id: 'counter', l: 'PRIZE COUNTER  換領處' }, { id: 'coll', l: 'COLLECTION  收藏' },
+    { id: 'sound', l: 'SOUND: ' + (S.sound ? 'ON' : 'OFF') }, { id: 'keys', l: 'KEYS: ' + (S.swap ? 'UP=RIGHT' : 'UP=LEFT') }, { id: 'reset', l: S.armed ? 'RESET? OK AGAIN' : 'RESET PROGRESS' }];
+  if (S.mode === 'pause') return [{ id: 'resume', l: 'RESUME  繼續' }, { id: 'title', l: 'TITLE  返主頁' }, { id: 'sound', l: 'SOUND: ' + (S.sound ? 'ON' : 'OFF') }];
+  if (S.mode === 'counter') return THEMES.map((t, i) => ({ id: 'theme', i, l: t.zh + ' ' + t.en })).concat([{ id: 'back', l: 'BACK  返回' }]);
+  return [{ id: 'back', l: 'BACK  返回' }];
+}
+function menuChoose(it) {
+  switch (it.id) {
+    case 'play': S.mode = 'play'; S.holdT = S.okT = S.edgeT = 0; break;
+    case 'resume': S.mode = 'play'; break;
+    case 'title': save(); S.mode = 'title'; S.menu = 0; break;
+    case 'counter': S.mode = 'counter'; S.menu = S.theme; break;
+    case 'coll': S.mode = 'coll'; S.menu = 0; break;
+    case 'back': S.mode = 'title'; S.menu = 0; break;
+    case 'sound': S.sound = !S.sound; save(); break;
+    case 'keys': S.swap = !S.swap; save(); break;
+    case 'reset':
+      if (!S.armed) { S.armed = true; break; }
+      S.armed = false; resetProgress(); break;
+    case 'theme': {
+      const t = THEMES[it.i];
+      if (S.owned & (1 << it.i)) { S.theme = it.i; S.jp = Math.max(S.jp, t.jp); S.msg = 'NOW PLAYING: ' + t.en; S.msgT = 1.5; fixBalls(); save(); }
+      else if (S.tickets >= t.cost) { S.tickets -= t.cost; S.owned |= 1 << it.i; S.theme = it.i; S.jp = Math.max(S.jp, t.jp); S.msg = 'UNLOCKED ' + t.en + '!'; S.msgT = 2; fixBalls(); save(); }
+      else { S.msg = 'NEED ' + (t.cost - S.tickets) + ' MORE TICKETS'; S.msgT = 1.5; }
+      break;
+    }
+  }
+}
+function fixBalls() {   // each machine has its own number of bonus balls
+  const want = theme().balls;
+  let have = S.objs.filter((o) => o.t === T_BALL).length + S.ballWait.length + S.drops.filter((d) => d.t === T_BALL).length;
+  while (have < want) { S.ballWait.push(0.5); have++; }
+}
+function resetProgress() {
+  const sound = S.sound, swap = S.swap;
+  freshState(); S.sound = sound; S.swap = swap;
+  newField(); save(); S.msg = 'PROGRESS RESET'; S.msgT = 1.5;
+}
+
+/* ---------------------------------------------------------------- save (NVS namespace 'pusher' on the board) */
+const KEY = 'pusher';
+function save() {
+  const f = S.objs.map((o) => [o.t, Math.round(o.x * 16), Math.round(o.y * 16), o.layer, o.h, o.pid]);
+  const blob = { ver: 2, bank: S.bank, tickets: S.tickets, jp: Math.round(S.jp * 10), theme: S.theme, owned: S.owned, coll: S.coll, setsDone: S.setsDone,
+    sound: S.sound, swap: S.swap, regenT: Math.round(S.regenT), playT: Math.round(S.playT), pushT: S.pushT % C.PUSH_PERIOD, field: f, ballWait: S.ballWait.length, stats: S.stats };
+  try { localStorage.setItem(KEY, JSON.stringify(blob)); } catch (e) { /* storage off: play without saving */ }
+}
+function load() {
+  let b = null;
+  try { b = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { b = null; }
+  freshState();
+  if (!b || b.ver !== 2) { newField(); return false; }
+  Object.assign(S, { bank: b.bank, tickets: b.tickets, jp: b.jp / 10, theme: b.theme, owned: b.owned, coll: b.coll, setsDone: b.setsDone,
+    sound: b.sound, swap: b.swap, regenT: b.regenT, playT: b.playT, pushT: b.pushT, stats: b.stats });
+  S.objs = [];
+  for (const e of b.field) { const o = mk(e[0], e[1] / 16, e[2] / 16, e[3]); if (o) { o.h = 0; o.pid = e[5]; } }
+  for (let i = 0; i < b.ballWait; i++) S.ballWait.push(1);
+  S.pushY = C.PUSH_MIN + (C.PUSH_MAX - C.PUSH_MIN) * (0.5 - 0.5 * Math.cos(2 * Math.PI * S.pushT / C.PUSH_PERIOD));
+  S.field0 = coinsInMachine();
+  return true;
+}
+/* ---------------------------------------------------------------- sound */
+let actx = null;
+function audioInit() { if (actx || !window.AudioContext) return; try { actx = new AudioContext(); } catch (e) { actx = null; } }
+function sfx(f, d, type) {
+  if (!S.sound || !actx) return;
+  const o = actx.createOscillator(), gn = actx.createGain();
+  o.type = type || 'square'; o.frequency.value = f; gn.gain.value = 0.05;
+  gn.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + d);
+  o.connect(gn); gn.connect(actx.destination); o.start(); o.stop(actx.currentTime + d);
+}
+
+/* ---------------------------------------------------------------- drawing */
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+const FY0 = 78, FY1 = 204;
+const sy = (y) => FY0 + (y / C.FL) * (FY1 - FY0);
+const sc = (y) => 0.72 + 0.46 * (y / C.FL);
+const sx = (x, y) => 160 + (x - C.FW / 2) * sc(y);
+function R(x, y, w, h, c) { g.fillStyle = c; g.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function text(s, x, y, c, size, align) { g.font = 'bold ' + (size || 8) + 'px monospace'; g.textAlign = align || 'left'; g.textBaseline = 'top'; g.fillStyle = '#000'; g.fillText(s, x + 1, y + 1); g.fillStyle = c; g.fillText(s, x, y); }
+function ell(x, y, rx, ry, c) { g.fillStyle = c; g.beginPath(); g.ellipse(x, y, Math.max(0.5, rx), Math.max(0.5, ry), 0, 0, Math.PI * 2); g.fill(); }
+function poly(pts, c) { g.fillStyle = c; g.beginPath(); g.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) g.lineTo(pts[i], pts[i + 1]); g.closePath(); g.fill(); }
+
+function drawCoin(x, y, lift) {
+  const s = sc(y), X = sx(x, y), Y = sy(y) - lift, rx = C.R * s, ry = C.R * s * 0.5;
+  ell(X, Y + 1.6 * s, rx, ry, '#8a5a12');
+  ell(X, Y, rx, ry, '#f2c230');
+  ell(X, Y, rx * 0.7, ry * 0.7, '#e0a820');
+  ell(X - rx * 0.3, Y - ry * 0.35, rx * 0.3, ry * 0.25, '#fff2b0');
+}
+function drawObj(o, lift) {
+  const s = sc(o.y), X = sx(o.x, o.y), Y = sy(o.y) - lift;
+  if (o.t === T_COIN) return drawCoin(o.x, o.y, lift + (o.h ? 3.2 * s : 0));
+  if (o.t === T_BALL) {
+    const r = o.r * s;
+    ell(X, Y + r * 0.35, r, r * 0.45, 'rgba(0,0,0,.35)');
+    ell(X, Y - r * 0.55, r, r, '#e83a5a'); R(X - r, Y - r * 0.7, r * 2, r * 0.32, '#fff');
+    ell(X - r * 0.35, Y - r, r * 0.3, r * 0.25, '#ffd0dc');
+    return;
+  }
+  const p = THEMES[Math.floor(o.pid / 6)].prizes[o.pid % 6], r = o.r * s;   // prize capsule
+  ell(X, Y + r * 0.3, r, r * 0.45, 'rgba(0,0,0,.35)');
+  ell(X, Y - r * 0.5, r, r * 0.9, p[2]);
+  R(X - r, Y - r * 0.55, r * 2, 2, '#fff');
+  ell(X - r * 0.35, Y - r * 0.9, r * 0.28, r * 0.22, '#ffffffaa');
+}
+
+function drawMachine() {
+  const th = theme();
+  R(0, 0, 320, 240, th.sky);
+  // top display
+  R(40, 16, 240, 42, '#0b0b14'); R(42, 18, 236, 38, th.wall);
+  for (let i = 0; i < 12; i++) R(44 + i * 20, 17, 6, 2, (Math.floor(S.time * 4) + i) % 3 ? th.lamp : '#333');
+  if (S.jpc) drawJpc(); else if (S.roul) drawWheel(); else drawSlot();
+  text('JP ' + String(Math.floor(S.jp)).padStart(5, '0'), 160, 2, '#ff6060', 8, 'center');
+  // back wall with the chance gate and pending-spin lamps
+  poly([sx(0, 0) - 6, FY0 - 16, sx(C.FW, 0) + 6, FY0 - 16, sx(C.FW, 0) + 6, FY0, sx(0, 0) - 6, FY0], '#1a1a28');
+  const gx = gateX(), gw = C.GATE_W * th.gate * sc(0);
+  R(sx(gx, 0) - gw / 2, FY0 - 12, gw, 7, '#000'); R(sx(gx, 0) - gw / 2, FY0 - 13, gw, 1, th.accent);
+  text('CHANCE', sx(gx, 0), FY0 - 12, th.accent, 5, 'center');
+  for (let i = 0; i < C.SLOT_Q; i++) ell(sx(C.FW, 0) - 6 - i * 7, FY0 - 4, 2.2, 2.2, i < S.slotQ ? '#ffd23a' : '#444');
+  // field floor, side walls and gutters
+  poly([sx(0, 0), FY0, sx(C.FW, 0), FY0, sx(C.FW, C.FL), FY1, sx(0, C.FL), FY1], th.field);
+  for (let y = 10; y < C.FL; y += 20) R(sx(0, y), sy(y), C.FW * sc(y), 1, 'rgba(255,255,255,.05)');
+  const wy = sy(C.WALL_END);
+  poly([sx(0, 0) - 7, FY0, sx(0, 0), FY0, sx(0, C.WALL_END), wy, sx(0, C.WALL_END) - 9, wy], th.wall);
+  poly([sx(C.FW, 0), FY0, sx(C.FW, 0) + 7, FY0, sx(C.FW, C.WALL_END) + 9, wy, sx(C.FW, C.WALL_END), wy], th.wall);
+  poly([sx(0, C.WALL_END) - 9, wy, sx(0, C.WALL_END), wy, sx(0, C.FL), FY1, sx(0, C.FL) - 12, FY1], '#05050a');
+  poly([sx(C.FW, C.WALL_END), wy, sx(C.FW, C.WALL_END) + 9, wy, sx(C.FW, C.FL) + 12, FY1, sx(C.FW, C.FL), FY1], '#05050a');
+  // pusher plate: top surface + front face
+  const py = S.pushY, lift = 6;
+  poly([sx(0, 0), FY0 - lift, sx(C.FW, 0), FY0 - lift, sx(C.FW, py), sy(py) - lift * sc(py), sx(0, py), sy(py) - lift * sc(py)], th.plate);
+  for (const o of S.objs) if (o.layer === 1) drawObj(o, lift * sc(o.y));
+  R(sx(0, py), sy(py) - lift * sc(py), C.FW * sc(py), lift * sc(py) + 1, '#4a5068');
+  R(sx(0, py), sy(py) - lift * sc(py), C.FW * sc(py), 1, '#fff8');
+  // field objects back to front
+  const f = S.objs.filter((o) => o.layer === 0).sort((a, b) => (a.y + a.h * 0.5) - (b.y + b.h * 0.5));
+  for (const o of f) drawObj(o, 0);
+  // front lip: pays in the middle, lose holes at the corners
+  R(sx(0, C.FL) - 12, FY1, C.FW * sc(C.FL) + 24, 3, '#05050a');
+  R(sx(C.FW / 2 - C.PAY_W / 2, C.FL), FY1, C.PAY_W * sc(C.FL), 3, th.accent);
+  R(18, FY1 + 3, 284, 33, '#111'); R(22, FY1 + 6, 276, 26, S.trayFlash > 0 ? '#3a3010' : '#1c1c24');
+  // coins in flight and the dropper
+  const ax = sx(S.aim, 0);
+  for (const d of S.drops) {
+    const k = Math.min(1, d.age / C.DROP_TIME), y = 60 + k * (FY0 - 66);
+    const X = sx(d.x, 0) + (sx(S.aim, 0) - sx(d.x, 0)) * (1 - k) * (d.free ? 0 : 1);
+    if (d.t === T_COIN) { ell(X, y, 4, 2.5, '#f2c230'); ell(X, y + 1, 4, 1.5, '#8a5a12'); } else ell(X, y, 6, 5, d.t === T_BALL ? '#e83a5a' : '#ffd0f0');
+  }
+  R(ax - 7, 58, 14, 5, '#ccc'); R(ax - 3, 63, 6, 3, '#999'); poly([ax - 3, 54, ax + 3, 54, ax, 58], th.accent);
+}
+function drawSlot() {
+  const s = S.slot;
+  for (let i = 0; i < 3; i++) {
+    const x = 112 + i * 34;
+    R(x, 22, 28, 30, '#fff8e8'); R(x, 22, 28, 2, '#0003');
+    let sym;
+    if (s && s.t < 0.9 + i * 0.4) sym = Math.floor(s.t * 20 + i * 2) % 5; else sym = s ? s.reels[i] : i;
+    drawSym(sym, x + 14, 37);
+  }
+}
+function drawSym(k, x, y) {
+  if (k === 0) { ell(x - 4, y + 3, 4, 4, '#d0203a'); ell(x + 4, y + 3, 4, 4, '#d0203a'); R(x - 1, y - 8, 2, 8, '#2a8a2a'); }
+  else if (k === 1) { poly([x - 7, y + 6, x + 7, y + 6, x + 4, y - 6, x - 4, y - 6], '#f0b020'); ell(x, y + 7, 2, 2, '#a07010'); }
+  else if (k === 2) { poly([x, y - 9, x + 3, y - 2, x + 9, y - 2, x + 4, y + 2, x + 6, y + 9, x, y + 5, x - 6, y + 9, x - 4, y + 2, x - 9, y - 2, x - 3, y - 2], '#ffd23a'); }
+  else if (k === 3) { text('7', x, y - 9, '#e02020', 18, 'center'); }
+  else { ell(x, y + 2, 8, 7, '#c89a4a'); R(x - 3, y - 8, 6, 4, '#c89a4a'); text('$', x, y - 2, '#fff', 8, 'center'); }
+}
+function drawWheel() {
+  const r = S.roul, n = WHEEL.length;
+  const spin = r.t < 2.2 ? (1 - Math.pow(1 - r.t / 2.2, 3)) : 1;
+  const ang = (r.seg + 0.5) / n * Math.PI * 2 + (1 - spin) * 14;
+  g.save(); g.beginPath(); g.rect(42, 18, 236, 38); g.clip();   // the big wheel shows through the display window
+  for (let i = 0; i < n; i++) {
+    const a0 = i / n * Math.PI * 2 - ang - Math.PI / 2, a1 = (i + 1) / n * Math.PI * 2 - ang - Math.PI / 2;
+    g.fillStyle = WHEEL[i].jpc ? '#e02020' : WHEEL[i].t ? '#c83ca0' : i % 2 ? '#f2c230' : '#e09a20';
+    g.beginPath(); g.moveTo(160, 84); g.arc(160, 84, 64, a0, a1); g.closePath(); g.fill();
+  }
+  g.restore();
+  poly([156, 16, 164, 16, 160, 24], '#fff');
+  const w = WHEEL[r.seg];
+  if (r.t >= 2.2) text(w.jpc ? 'JP CHANCE!' : w.c ? '+' + w.c + ' COINS' : '+' + w.t + ' TICKETS', 160, 40, '#fff', 9, 'center');
+  else text('WHEEL', 160, 40, '#fff', 8, 'center');
+}
+function drawJpc() {
+  const j = S.jpc;
+  R(42, 18, 236, 38, '#200');
+  text('JACKPOT CHANCE', 160, 19, '#ffd23a', 8, 'center');
+  for (let i = 0; i < 4; i++) {
+    const x = 88 + i * 48, p = POCKETS[i];
+    R(x - 18, 42, 36, 12, i === j.pocket && j.t > 2.6 ? '#ffd23a' : '#552');
+    text(p.jp ? 'JP' : String(p.c), x, 44, '#fff', 7, 'center');
+  }
+  const k = Math.min(1, j.t / 2.6), turns = 3;
+  const tx = 88 + j.pocket * 48;
+  const bx = j.t < 2.6 ? 160 + Math.sin(k * turns * Math.PI * 2) * 70 * (1 - k * 0.6) * (1 - k) + (tx - 160) * k : tx;
+  ell(bx, 36 + k * 4, 4, 4, '#e83a5a');
+}
+function drawHud() {
+  R(0, 0, 320, 14, 'rgba(0,0,0,.55)');
+  ell(9, 7, 5, 4, '#f2c230'); text(String(S.bank), 17, 3, '#ffd23a', 8);
+  text('T ' + S.tickets, 316, 3, '#ff9ad5', 8, 'right');
+  let y = 120;
+  for (const p of S.popups) { text(p.text, 160, y - (1.2 - p.t) * 14, p.col, 9, 'center'); y += 12; }
+  if (S.msgT > 0) text(S.msg, 160, 212, '#fff', 8, 'center');
+  else text('WON ' + S.stats.won + '  ·  DROP ' + S.stats.dropped, 160, 214, '#999', 7, 'center');
+  if (S.edgeT > 0.2) { R(110, 226, 100, 5, '#333'); R(110, 226, 100 * S.edgeT / C.EDGE_HOLD, 5, '#fff'); }
+}
+function drawMenu(title, sub) {
+  R(0, 0, 320, 240, 'rgba(0,0,0,.6)');
+  text(title, 160, 22, '#ffd23a', 16, 'center');
+  if (sub) text(sub, 160, 44, '#ff9a3c', 8, 'center');
+  const items = menuItems();
+  R(48, 60, 224, items.length * 16 + 8, 'rgba(10,10,30,.85)');
+  items.forEach((it, i) => {
+    const y = 66 + i * 16;
+    if (i === S.menu) { R(50, y - 3, 220, 14, 'rgba(255,255,255,.15)'); text('▶', 56, y, '#ffd23a', 8); }
+    let col = i === S.menu ? '#fff' : '#aaa';
+    let label = it.l;
+    if (it.id === 'theme') {
+      const owned = S.owned & (1 << it.i);
+      label += owned ? (it.i === S.theme ? '  ✓ IN USE' : '  OWNED') : '  ' + THEMES[it.i].cost + 'T';
+      if (!owned) col = S.tickets >= THEMES[it.i].cost ? '#9f9' : '#777';
+    }
+    text(label, 68, y, col, 8);
+  });
+  text('COINS ' + S.bank + '   TICKETS ' + S.tickets, 160, 200, '#ffd23a', 8, 'center');
+  if (S.msgT > 0) text(S.msg, 160, 214, '#fff', 8, 'center');
+}
+function drawCollection() {
+  R(0, 0, 320, 240, '#101020');
+  text('COLLECTION 收藏', 160, 6, '#ffd23a', 12, 'center');
+  THEMES.forEach((t, ti) => {
+    const y = 28 + ti * 44;
+    text(t.zh + ' ' + t.en + ((S.setsDone & (1 << ti)) ? '  ★ SET' : ''), 10, y, (S.owned & (1 << ti)) ? '#fff' : '#666', 8);
+    t.prizes.forEach((p, i) => {
+      const x = 26 + i * 50, n = S.coll[ti * 6 + i];
+      ell(x, y + 24, 9, 8, n ? p[2] : '#333');
+      text(n ? 'x' + n : '?', x + 12, y + 20, n ? '#ddd' : '#555', 7);
+    });
+  });
+  text('OK = BACK', 160, 226, '#aaa', 8, 'center');
+}
+function render() {
+  drawMachine();
+  if (S.mode === 'play') drawHud();
+  else if (S.mode === 'title') drawMenu('金幣嘉年華', 'COIN CARNIVAL · VIRTUAL COINS ONLY');
+  else if (S.mode === 'pause') drawMenu('PAUSED 暫停');
+  else if (S.mode === 'counter') drawMenu('PRIZE COUNTER 換領處', 'SPEND TICKETS ON NEW MACHINES');
+  else drawCollection();
+}
+
+/* ---------------------------------------------------------------- loop */
+function step(dt) {
+  stepInput(dt);
+  if (S.mode === 'play') updatePlay(dt);
+  else S.time += dt;
+  decay(dt);
+}
+let acc = 0, last = performance.now(), running = true;
+function frame(now) {
+  if (!running) return;
+  acc += Math.min(0.1, (now - last) / 1000); last = now;
+  let n = 0;
+  while (acc >= C.DT && n < 3) { step(C.DT); acc -= C.DT; n++; }
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* keyboard + buttons */
+const KEYMAP = { ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down', Space: 'ok', Enter: 'ok' };
+addEventListener('keydown', (e) => { const k = KEYMAP[e.code]; if (k) { setKey(k, true); e.preventDefault(); } });
+addEventListener('keyup', (e) => { const k = KEYMAP[e.code]; if (k) { setKey(k, false); e.preventDefault(); } });
+for (const [id, k] of [['bu', 'up'], ['bo', 'ok'], ['bd', 'down']]) {
+  const b = document.getElementById(id);
+  b.addEventListener('pointerdown', (e) => { setKey(k, true); e.preventDefault(); });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, () => setKey(k, false));
+}
+
+load();
+render();
+requestAnimationFrame(frame);
+
+/* test hooks */
+window.__CP = { C, S, THEMES, WHEEL, POCKETS, SLOT_TABLE, step, render, setKey, save, load, seed, newField, freshState, coinsInMachine,
+  physics, menuItems, mint, collect, startJpc, startRoulette, gateX, dropCoin,
+  stop: () => { running = false; }, T_COIN, T_BALL, T_PRIZE };
+</script>
+</body>
+</html>
